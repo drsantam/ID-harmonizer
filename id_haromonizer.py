@@ -9,7 +9,8 @@ Workflow:
      stripped of alphabets and with all special characters / spaces
      converted to underscores.
   4. Reads all DICOM files found inside zip files (nested zips supported)
-     from a local `dicom/` folder and extracts the patient ids.
+     AND all loose DICOM files in subfolders of the `dicom/` folder,
+     extracting the patient ids.
   5. Matches DICOM patient ids to the cleaned CSV patient ids and copies
      the matching DICOM files to the output folder organized by
      Study > Series > Instance, file name being
@@ -187,7 +188,18 @@ def _read_header(zf, info):
     return None
 
 
-def _record(ds, source, zip_path, nested, member, size):
+def _read_header_file(path: Path):
+    """Read *tags only* from a loose (non-archived) DICOM file."""
+    for kwargs in ({}, {"force": True}):
+        try:
+            with open(path, "rb") as raw:
+                return pydicom.dcmread(raw, stop_before_pixels=True, **kwargs)
+        except Exception:
+            continue
+    return None
+
+
+def _record(ds, source, zip_path, nested, member, size, file_path=None):
     pid = _elem_value(ds, "PatientID") or _elem_value(ds, "PatientName")
     sop_uid = _safe_component(_elem_value(ds, "SOPInstanceUID"))
     modality = _modality_token(_elem_value(ds, "Modality"))
@@ -201,11 +213,15 @@ def _record(ds, source, zip_path, nested, member, size):
         # <SOP Instance UID>_<Modality>.dcm
         "instance_name": f"{sop_uid}_{modality}.dcm",
         # Where the bytes live: reopened lazily in pass 2, never kept in RAM.
-        "zip_path": Path(zip_path),
+        "zip_path": Path(zip_path) if zip_path else None,
         "nested": tuple(nested),
         "member": member,
         "size": size,
         "source": source,
+        # "zip"  -> bytes live at zip_path/nested/member (streamed in pass 2)
+        # "file" -> bytes live at file_path (plain file in a dicom subfolder)
+        "kind": "file" if file_path else "zip",
+        "file_path": Path(file_path) if file_path else None,
     }
 
 
@@ -242,7 +258,14 @@ def build_dicom_index(dicom_dir: Path, progress=True):
         return index
 
     zip_paths = sorted(p for p in dicom_dir.rglob("*.zip") if p.is_file())
-    print(f"\nPass 1/2: reading DICOM headers from {len(zip_paths)} archive(s)")
+    # Loose (non-archived) DICOM files: any file inside the dicom folder tree
+    # that is not a zip (subfolders scanned recursively).
+    loose_paths = sorted(
+        p for p in dicom_dir.rglob("*")
+        if p.is_file() and not p.name.lower().endswith(".zip")
+    )
+    print(f"\nPass 1/2: reading DICOM headers from {len(zip_paths)} archive(s)"
+          + (f" + {len(loose_paths)} loose file(s) in subfolders" if loose_paths else ""))
 
     nested_seen = set()
     sigs = {}
@@ -289,6 +312,41 @@ def build_dicom_index(dicom_dir: Path, progress=True):
                   f"{f', {skipped} unreadable' if skipped else ''}"
                   f" ({total_recs} total, {time.time() - started:.0f}s)")
 
+    if loose_paths:
+        loose_count = loose_skipped = 0
+        local_pids = set()
+        for i, fpath in enumerate(loose_paths, 1):
+            try:
+                ds = _read_header_file(fpath)
+            except OSError:
+                loose_skipped += 1
+                continue
+            if ds is None:
+                loose_skipped += 1
+                continue
+            rec = _record(
+                ds,
+                fpath.relative_to(dicom_dir).as_posix(),
+                None,
+                (),
+                None,
+                fpath.stat().st_size,
+                file_path=fpath,
+            )
+            if not rec["cleaned_id"]:
+                loose_skipped += 1
+                continue
+            index.setdefault(rec["cleaned_id"], []).append(rec)
+            local_pids.add(rec["cleaned_id"])
+            loose_count += 1
+            if progress and i % 500 == 0:
+                print(f"  loose files: {i}/{len(loose_paths)}"
+                      f" ({total_recs + loose_count} total, {time.time() - started:.0f}s)", flush=True)
+        total_recs += loose_count
+        if progress:
+            print(f"  loose files in subfolders: {loose_count} DICOM files for {len(local_pids)} patients"
+                  f"{f', {loose_skipped} unreadable' if loose_skipped else ''}")
+
     for pid in index:
         index[pid].sort(key=lambda r: (r["study_uid"], r["series_uid"], r["sop_uid"]))
     print(f"  Indexed {total_recs} DICOM files for {len(index)} patients"
@@ -313,6 +371,14 @@ class MemberReader:
         self._dirs = set()
 
     def _open(self, rec):
+        if rec["kind"] == "file":
+            # Loose files need nothing opened: copy_to/spool use the path.
+            key = ("file", str(rec["file_path"]))
+            if key == self._key:
+                return
+            self.close()
+            self._key = key
+            return
         key = (str(rec["zip_path"]), "/".join(rec["nested"]))
         if key == self._key and self._zf is not None:
             return
@@ -341,9 +407,12 @@ class MemberReader:
         self.ensure_dir(dest.parent)
         tmp = dest.with_name(dest.name + ".part")
         try:
-            with self._zf.open(rec["member"]) as src, open(tmp, "wb") as out:
-                shutil.copyfileobj(src, out, COPY_CHUNK)
-                out.flush()
+            if rec["kind"] == "file":
+                shutil.copyfile(rec["file_path"], tmp)
+            else:
+                with self._zf.open(rec["member"]) as src, open(tmp, "wb") as out:
+                    shutil.copyfileobj(src, out, COPY_CHUNK)
+                    out.flush()
             os.replace(tmp, dest)
         finally:
             tmp.unlink(missing_ok=True)
@@ -353,6 +422,9 @@ class MemberReader:
 
         Needed when the member has to be parsed and resaved; caller closes it.
         """
+        if rec["kind"] == "file":
+            # The source file itself is already seekable: no spooling needed.
+            return open(rec["file_path"], "rb")
         self._open(rec)
         tmp = tempfile.SpooledTemporaryFile(max_size=SPOOL_LIMIT)
         try:
@@ -430,7 +502,9 @@ def _write_fixed_patient_id(fp, dest: Path, patient_id: str):
 
 def _origin_key(rec):
     """Stable identity of the physical source of a record."""
-    return (str(rec["zip_path"]), "/".join(rec["nested"]), rec["member"])
+    if rec["kind"] == "file":
+        return ("file", str(rec["file_path"]))
+    return ("zip", str(rec["zip_path"]), "/".join(rec["nested"]), rec["member"])
 
 
 def _instance_key(rec):
@@ -457,6 +531,8 @@ def _joined(values):
 
 
 def _archive_label(rec):
+    if rec["kind"] == "file":
+        return rec["source"]
     if rec["nested"]:
         return f"{rec['zip_path'].name}!{'>'.join(rec['nested'])}"
     return rec["zip_path"].name
@@ -703,7 +779,8 @@ def write_unmatched_report(dicom_index, all_seen, results_dir):
     """Write results/unmatched.csv: which DICOM patients matched no CSV row.
 
     Counts are unique SOP instances (what actually lands in unmatched/), and the
-    source column names the archive (and inner archive, if nested) they came from.
+    source column names the archive (and inner archive, if nested) or the loose
+    file path they came from.
     """
     path = Path(results_dir) / "unmatched.csv"
     patients = [(pid, recs) for pid, recs in sorted(dicom_index.items()) if pid not in all_seen]
@@ -723,7 +800,7 @@ def write_unmatched_report(dicom_index, all_seen, results_dir):
 def main():
     parser = argparse.ArgumentParser(description="Match DICOM patient ids to cleaned CSV patient ids.")
     parser.add_argument("--csv-dir", default=DEFAULT_CSV_DIR, help=f"Folder with input CSV files (default: {DEFAULT_CSV_DIR})")
-    parser.add_argument("--dicom-dir", default=DEFAULT_DICOM_DIR, help=f"Folder with DICOM zip files (default: {DEFAULT_DICOM_DIR})")
+    parser.add_argument("--dicom-dir", default=DEFAULT_DICOM_DIR, help=f"Folder with DICOM zip files and/or subfolders of loose DICOM files (default: {DEFAULT_DICOM_DIR})")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help=f"Folder for cleaned / matched / unmatched outputs (default: {DEFAULT_OUTPUT_DIR})")
     parser.add_argument("--skip-unmatched", action="store_true",
                         help="Do not copy unmatched DICOM files (saves a full second pass and one copy of the corpus)")

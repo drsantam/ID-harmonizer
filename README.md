@@ -9,8 +9,9 @@ copies the matching DICOM files into a clean, organized output folder.
 2. Prompts you to select the column that holds the patient id.
 3. Writes a cleaned copy of the CSV to the output folder (patient id stripped
    of alphabets, special characters/spaces converted to underscores).
-4. Reads all DICOM files inside zip files (nested zips supported) from the
-   `dicom/` folder and extracts the patient ids.
+4. Reads all DICOM files inside zip files (nested zips supported) AND all loose
+   DICOM files in subfolders of the `dicom/` folder (scanned recursively),
+   extracting the patient ids.
 5. Matches DICOM ids to the cleaned CSV ids and copies matching files to
    `output/matched/`, organized as `Study > Series > Instance`, named
    `<SOP Instance UID>_<Modality>.dcm`. The `PatientID` tag of each copied
@@ -34,8 +35,9 @@ pip install -r requirements.txt
 
 ## Running
 
-Place your input CSV files in `csv/` and your DICOM zip files in `dicom/`,
-then run:
+Place your input CSV files in `csv/` and your DICOM inputs in `dicom/` (zip
+files, plus subfolders containing loose DICOM files - subfolders are scanned
+recursively), then run:
 
 ```bash
 python3 id_haromonizer.py
